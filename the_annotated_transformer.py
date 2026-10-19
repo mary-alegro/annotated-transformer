@@ -101,7 +101,7 @@
 # %% id="NwClcbH6Tsp8"
 # # Uncomment for colab
 # #
-# # !pip install -q torchdata==0.3.0 torchtext==0.12 spacy==3.2 altair GPUtil
+# # !pip install -q datasets spacy altair
 # # !python -m spacy download de_core_news_sm
 # # !python -m spacy download en_core_web_sm
 
@@ -118,12 +118,10 @@ import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
-from torchtext.data.functional import to_map_style_dataset
+from collections import Counter
 from torch.utils.data import DataLoader
-from torchtext.vocab import build_vocab_from_iterator
-import torchtext.datasets as datasets
+from datasets import load_dataset  # HuggingFace datasets (data only)
 import spacy
-import GPUtil
 import warnings
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -1388,8 +1386,12 @@ def example_simple_model():
 # %% [markdown] id="8y9dpfolTsqL" tags=[]
 # ## Data Loading
 #
-# > We will load the dataset using torchtext and spacy for
+# > We will load the dataset using HuggingFace `datasets` and spacy for
 # > tokenization.
+#
+# torchtext is deprecated, so we fetch Multi30k from the HuggingFace
+# hub (`bentrevett/multi30k`) and write a tiny vocabulary class that
+# mimics the parts of `torchtext.vocab.Vocab` used in this notebook.
 
 # %%
 # Load spacy tokenizer models, download them if they haven't been
@@ -1423,6 +1425,58 @@ def yield_tokens(data_iter, tokenizer, index):
         yield tokenizer(from_to_tuple[index])
 
 
+# %%
+def load_multi30k():
+    "Return the train, validation and test splits as lists of (de, en) pairs."
+    data = load_dataset("bentrevett/multi30k")
+    return tuple(
+        [(ex["de"], ex["en"]) for ex in data[split]]
+        for split in ("train", "validation", "test")
+    )
+
+
+class Vocab:
+    "Minimal replacement for torchtext.vocab.Vocab."
+
+    def __init__(self, itos):
+        self.itos = list(itos)
+        self.stoi = {tok: i for i, tok in enumerate(self.itos)}
+        self.default_index = None
+
+    def __len__(self):
+        return len(self.itos)
+
+    def __getitem__(self, token):
+        return self.stoi.get(token, self.default_index)
+
+    def __call__(self, tokens):
+        "Map a list of tokens to a list of indices."
+        return [self[tok] for tok in tokens]
+
+    def set_default_index(self, index):
+        self.default_index = index
+
+    def get_stoi(self):
+        return self.stoi
+
+    def get_itos(self):
+        return self.itos
+
+
+def build_vocab_from_iterator(iterator, min_freq=1, specials=()):
+    "Specials first, then tokens sorted by frequency (ties alphabetical)."
+    counter = Counter()
+    for tokens in iterator:
+        counter.update(tokens)
+    tokens = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
+    itos = list(specials) + [
+        tok
+        for tok, freq in tokens
+        if freq >= min_freq and tok not in specials
+    ]
+    return Vocab(itos)
+
+
 # %% id="jU3kVlV5okC-" tags=[]
 
 
@@ -1434,7 +1488,7 @@ def build_vocabulary(spacy_de, spacy_en):
         return tokenize(text, spacy_en)
 
     print("Building German Vocabulary ...")
-    train, val, test = datasets.Multi30k(language_pair=("de", "en"))
+    train, val, test = load_multi30k()
     vocab_src = build_vocab_from_iterator(
         yield_tokens(train + val + test, tokenize_de, index=0),
         min_freq=2,
@@ -1442,7 +1496,6 @@ def build_vocabulary(spacy_de, spacy_en):
     )
 
     print("Building English Vocabulary ...")
-    train, val, test = datasets.Multi30k(language_pair=("de", "en"))
     vocab_tgt = build_vocab_from_iterator(
         yield_tokens(train + val + test, tokenize_en, index=1),
         min_freq=2,
@@ -1458,9 +1511,13 @@ def build_vocabulary(spacy_de, spacy_en):
 def load_vocab(spacy_de, spacy_en):
     if not exists("vocab.pt"):
         vocab_src, vocab_tgt = build_vocabulary(spacy_de, spacy_en)
-        torch.save((vocab_src, vocab_tgt), "vocab.pt")
+        # save plain token lists so torch.load(weights_only=True) works
+        torch.save((vocab_src.get_itos(), vocab_tgt.get_itos()), "vocab.pt")
     else:
-        vocab_src, vocab_tgt = torch.load("vocab.pt")
+        itos_src, itos_tgt = torch.load("vocab.pt")
+        vocab_src, vocab_tgt = Vocab(itos_src), Vocab(itos_tgt)
+        vocab_src.set_default_index(vocab_src["<unk>"])
+        vocab_tgt.set_default_index(vocab_tgt["<unk>"])
     print("Finished.\nVocabulary sizes:")
     print(len(vocab_src))
     print(len(vocab_tgt))
@@ -1477,7 +1534,7 @@ if is_interactive_notebook():
 #
 # > Batching matters a ton for speed. We want to have very evenly
 # > divided batches, with absolutely minimal padding. To do this we
-# > have to hack a bit around the default torchtext batching. This
+# > have to hack a bit around the default batching. This
 # > code patches their default batching to make sure we search over
 # > enough sentences to find tight batches.
 
@@ -1577,17 +1634,15 @@ def create_dataloaders(
             pad_id=vocab_src.get_stoi()["<blank>"],
         )
 
-    train_iter, valid_iter, test_iter = datasets.Multi30k(
-        language_pair=("de", "en")
-    )
+    train_iter, valid_iter, test_iter = load_multi30k()
 
-    train_iter_map = to_map_style_dataset(
-        train_iter
-    )  # DistributedSampler needs a dataset len()
+    # lists of (de, en) pairs are already map-style datasets with a len(),
+    # which DistributedSampler needs
+    train_iter_map = train_iter
     train_sampler = (
         DistributedSampler(train_iter_map) if is_distributed else None
     )
-    valid_iter_map = to_map_style_dataset(valid_iter)
+    valid_iter_map = valid_iter
     valid_sampler = (
         DistributedSampler(valid_iter_map) if is_distributed else None
     )
@@ -1685,7 +1740,15 @@ def train_worker(
             train_state=train_state,
         )
 
-        GPUtil.showUtilization()
+        # PyTorch's own allocator stats (GPUtil doesn't work on
+        # integrated-memory GPUs such as the GB10)
+        print(
+            f"[GPU{gpu}] Memory allocated: "
+            f"{torch.cuda.memory_allocated(gpu) / 2**30:.2f} GB | "
+            f"reserved: {torch.cuda.memory_reserved(gpu) / 2**30:.2f} GB | "
+            f"peak: {torch.cuda.max_memory_allocated(gpu) / 2**30:.2f} GB",
+            flush=True,
+        )
         if is_main_process:
             file_path = "%s%.2d.pt" % (config["file_prefix"], epoch)
             torch.save(module.state_dict(), file_path)
